@@ -1,0 +1,9 @@
+secrets/
+*.db
+*.sqlite
+*.sqlite3
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
