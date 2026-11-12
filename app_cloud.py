@@ -34,6 +34,9 @@ class HybridRow(dict):
         return super().__getitem__(key)
 
 def hybrid_row_factory(cursor):
+    if cursor.description is None:
+        return None
+
     columns = [col.name for col in cursor.description]
 
     def make_row(values):
