@@ -4,6 +4,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from datetime import date
 import os
+import hashlib
+import secrets
 import psycopg
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -569,7 +571,12 @@ def add_student():
                 duplicate=con.execute("SELECT id FROM students WHERE seat=? AND shift=?",(vals[3],vals[4])).fetchone()
                 if duplicate: message="This seat is already assigned in this shift."
                 else:
-                    con.execute("INSERT INTO students(name,guardian,mobile,seat,shift,admission_date) VALUES(?,?,?,?,?,?)",(*vals,admission))
+                    con.execute(
+                        """INSERT INTO students
+                           (name,guardian,mobile,seat,shift,admission_date,status)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (*vals, admission, "Approved")
+                    )
                     flash("Student added successfully."); return redirect("/students")
     return page("Add Student","STUDENT DIRECTORY","students",STUDENT_FORM+"<p style='color:#ff9aa5'>{{ message }}</p>",s=None,button="Save Student",today=date.today().isoformat(),message=message)
 
@@ -799,6 +806,58 @@ def reports():
 <div class="panel"><h2>Monthly Financial Summary · {{ month }}</h2><div class="tablewrap"><table><tr><th>Metric</th><th>Amount</th></tr><tr><td>Fees generated</td><td>₹{{ '%.2f'|format(fee.total) }}</td></tr><tr><td>Fees collected</td><td>₹{{ '%.2f'|format(fee.paid) }}</td></tr><tr><td>Other income</td><td>₹{{ '%.2f'|format(income) }}</td></tr><tr><td>Expenses</td><td>₹{{ '%.2f'|format(expense) }}</td></tr><tr><td><b>Net income / expense</b></td><td><b>₹{{ '%.2f'|format(income-expense) }}</b></td></tr></table></div></div>"""
     return page("Reports","ANALYTICS","reports",content,month=month,total_students=total_students,present=present,absent=absent,fee=fee,income=income,expense=expense)
 
+@app.route("/api/student/register", methods=["POST"])
+def student_register():
+    data = request.get_json(silent=True) or {}
+
+    name = str(data.get("name") or "").strip()
+    guardian = str(data.get("guardian") or "").strip()
+    mobile = str(data.get("mobile") or "").strip()
+
+    if not name or not guardian or not mobile:
+        return jsonify({
+            "success": False,
+            "message": "Name, guardian name and mobile are required."
+        }), 400
+
+    if len(name) > 100 or len(guardian) > 100:
+        return jsonify({
+            "success": False,
+            "message": "Name is too long."
+        }), 400
+
+    if not mobile.isdigit() or len(mobile) != 10:
+        return jsonify({
+            "success": False,
+            "message": "Enter a valid 10-digit mobile number."
+        }), 400
+
+    with connect() as con:
+        duplicate = con.execute(
+            "SELECT id FROM students WHERE mobile=?",
+            (mobile,)
+        ).fetchone()
+
+        if duplicate:
+            return jsonify({
+                "success": False,
+                "message": "This mobile number is already registered. Contact Admin."
+            }), 409
+
+        con.execute(
+            """INSERT INTO students
+               (name, guardian, mobile, seat, shift, admission_date, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (name, guardian, mobile, "Pending", "Pending",
+             date.today().isoformat(), "Pending")
+        )
+
+    return jsonify({
+        "success": True,
+        "message": "Registration submitted. Please wait for Admin approval."
+    }), 201
+
+
 @app.route("/api/student/notices", methods=["GET"])
 def student_notices():
     with connect() as con:
@@ -820,44 +879,6 @@ def student_notices():
             for n in rows
         ]
     })
-
-@app.route("/api/student/register-fcm-token", methods=["POST"])
-def register_fcm_token():
-    data = request.get_json(silent=True) or {}
-
-    try:
-        student_id = int(data.get("student_id", 0))
-    except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Invalid student ID"}), 400
-
-    token = (data.get("token") or "").strip()
-
-    if student_id <= 0 or len(token) < 20:
-        return jsonify({"success": False, "message": "Invalid data"}), 400
-
-    with connect() as con:
-        student = con.execute(
-            "SELECT id, status FROM students WHERE id=?",
-            (student_id,)
-        ).fetchone()
-
-        if not student or student["status"].strip().lower() != "approved":
-            return jsonify({"success": False, "message": "Student not approved"}), 403
-
-        con.execute(
-            "DELETE FROM student_fcm_tokens WHERE token=? AND student_id!=?",
-            (token, student_id)
-        )
-
-        con.execute("""
-            INSERT INTO student_fcm_tokens(student_id, token)
-            VALUES(?, ?)
-            ON CONFLICT(student_id) DO UPDATE SET
-                token=excluded.token,
-                updated_at=CURRENT_TIMESTAMP
-        """, (student_id, token))
-
-    return jsonify({"success": True, "message": "Token registered"})
 
 @app.route("/api/student/profile", methods=["GET"])
 def student_profile():
@@ -916,7 +937,7 @@ def settings():
     content="""<div class="panel" style="max-width:600px"><h2>Change Admin Password</h2><form method="post">
 <label>CURRENT PASSWORD</label><input type="password" name="old_password" required><label>NEW PASSWORD</label><input type="password" name="new_password" minlength="8" required>
 <label>CONFIRM NEW PASSWORD</label><input type="password" name="confirm_password" minlength="8" required><button>Update Password</button></form>{% if message %}<p class="muted">{{ message }}</p>{% endif %}</div>
-<div class="panel"><h2>Application Details</h2><p class="muted">Librata Version 3 · Dark Premium Interface</p><p class="muted">Database: librata.db</p></div>"""
+<div class="panel"><h2>Application Details</h2><p class="muted">Librata Version 3 · Dark Premium Interface</p><p class="muted">Database: PostgreSQL</p></div>"""
     return page("Admin Settings","ADMIN","settings",content,message=message)
 
 
