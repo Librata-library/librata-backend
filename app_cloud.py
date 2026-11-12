@@ -34,9 +34,6 @@ class HybridRow(dict):
         return super().__getitem__(key)
 
 def hybrid_row_factory(cursor):
-    if cursor.description is None:
-        return lambda values: values
-
     columns = [col.name for col in cursor.description]
 
     def make_row(values):
@@ -1194,6 +1191,72 @@ def reject_student(student_id):
 
     flash("Student registration rejected.")
     return redirect("/pending_students")
+
+@app.route("/admin/import_students", methods=["POST"])
+@login_required
+def import_students():
+    data = request.get_json(silent=True) or {}
+    students = data.get("students", [])
+
+    if not isinstance(students, list) or len(students) > 100:
+        return {"ok": False, "message": "Invalid student data."}, 400
+
+    inserted = 0
+    skipped = 0
+
+    with connect() as con:
+        for s in students:
+            if not isinstance(s, dict):
+                skipped += 1
+                continue
+
+            name = str(s.get("name", "")).strip()
+            guardian = str(s.get("guardian", "")).strip()
+            mobile = str(s.get("mobile", "")).strip()
+            seat = str(s.get("seat", "")).strip()
+            shift = str(s.get("shift", "")).strip()
+            admission = str(s.get("admission_date", "")).strip() or date.today().isoformat()
+
+            if (
+                not all([name, guardian, mobile, seat])
+                or not mobile.isdigit()
+                or len(mobile) != 10
+                or shift not in ("Morning", "Evening")
+            ):
+                skipped += 1
+                continue
+
+            duplicate = con.execute(
+                "SELECT id FROM students WHERE mobile=?",
+                (mobile,)
+            ).fetchone()
+
+            if duplicate:
+                skipped += 1
+                continue
+
+            occupied = con.execute(
+                "SELECT id FROM students WHERE seat=? AND shift=?",
+                (seat, shift)
+            ).fetchone()
+
+            if occupied:
+                skipped += 1
+                continue
+
+            con.execute(
+                """INSERT INTO students
+                   (name, guardian, mobile, seat, shift, admission_date, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, guardian, mobile, seat, shift, admission, "Approved")
+            )
+            inserted += 1
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "skipped": skipped
+    }
 
 
 # Initialize PostgreSQL database
