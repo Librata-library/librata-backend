@@ -2,7 +2,8 @@ import json
 from flask import Flask, request, redirect, session, render_template_string, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import os
 import hashlib
 import secrets
@@ -406,7 +407,7 @@ NAV = """<aside class="sidebar"><div class="brand">LIBRA<span>TA</span></div><di
 <a href="/transactions" class="{{ 'active' if active=='transactions' else '' }}"><span class="ico">↗</span> Income & Expenses</a>
 <a href="/notices" class="{{ 'active' if active=='notices' else '' }}"><span class="ico">▤</span> Notices</a>
 <a href="/reports" class="{{ 'active' if active=='reports' else '' }}"><span class="ico">▥</span> Reports</a>
-<div class="navlabel">ADMIN</div><a href="/settings" class="{{ 'active' if active=='settings' else '' }}"><span class="ico">⚙</span> Settings</a>
+<div class="navlabel">ADMIN</div><a href="/pending_students" class="{{ 'active' if active=='pending_students' else '' }}"><span class="ico">♙</span> Pending Approvals</a><a href="/settings" class="{{ 'active' if active=='settings' else '' }}"><span class="ico">⚙</span> Settings</a>
 <a href="/logout"><span class="ico">↪</span> Logout</a></nav></aside>"""
 
 BASE = """<!doctype html><html lang="{{ 'hi' if lang=='hi' else 'en' }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ title }} | Librata</title>""" + STYLE + """</head><body><div class="shell">""" + NAV + """
@@ -1088,6 +1089,79 @@ def student_attendance():
         ]
     })
 
+@app.route("/api/student/attendance/check-in", methods=["POST"])
+def student_attendance_check_in():
+    student_auth = get_authenticated_student()
+    if not student_auth:
+        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
+
+    student_id = student_auth["id"]
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+    with connect() as con:
+        existing = con.execute(
+            "SELECT status FROM attendance WHERE student_id=? AND attend_date=?",
+            (student_id, today)
+        ).fetchone()
+        if existing:
+            if existing["status"] == "Absent":
+                return jsonify({"success": False, "message": "Your attendance is marked Absent by Admin. Please contact the Library Admin.", "status": "Absent"}), 409
+            return jsonify({"success": True, "already_marked": True, "message": "Your attendance is already marked Present today.", "status": "Present", "date": today})
+
+        inserted = con.execute("""
+            INSERT INTO attendance (student_id, attend_date, status)
+            VALUES (?, ?, 'Present')
+            ON CONFLICT(student_id, attend_date) DO NOTHING
+            RETURNING id
+        """, (student_id, today)).fetchone()
+        if not inserted:
+            current = con.execute(
+                "SELECT status FROM attendance WHERE student_id=? AND attend_date=?",
+                (student_id, today)
+            ).fetchone()
+            if current and current["status"] == "Absent":
+                return jsonify({"success": False, "message": "Your attendance is marked Absent by Admin. Please contact the Library Admin.", "status": "Absent"}), 409
+            return jsonify({"success": True, "already_marked": True, "message": "Your attendance is already marked Present today.", "status": "Present", "date": today})
+    return jsonify({"success": True, "already_marked": False, "message": "Attendance marked Present successfully.", "status": "Present", "date": today})
+
+
+@app.route("/api/student/fees", methods=["GET"])
+def student_fees():
+    student_auth = get_authenticated_student()
+    if not student_auth:
+        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
+    with connect() as con:
+        rows = con.execute("""
+            SELECT fee_month, amount, paid, status, paid_date
+            FROM fees WHERE student_id=? ORDER BY fee_month DESC, id DESC
+        """, (student_auth["id"],)).fetchall()
+    total_amount = sum(float(r["amount"] or 0) for r in rows)
+    total_paid = sum(float(r["paid"] or 0) for r in rows)
+    return jsonify({
+        "success": True, "total_amount": total_amount, "total_paid": total_paid,
+        "balance": max(0.0, total_amount-total_paid),
+        "fees": [{"fee_month": r["fee_month"], "amount": float(r["amount"] or 0),
+                  "paid": float(r["paid"] or 0), "status": r["status"], "paid_date": r["paid_date"]}
+                 for r in rows]
+    })
+
+
+@app.route("/api/student/books", methods=["GET"])
+def student_books():
+    student_auth = get_authenticated_student()
+    if not student_auth:
+        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
+    with connect() as con:
+        rows = con.execute("""
+            SELECT b.title, b.author, bi.issue_date, bi.return_date, bi.status
+            FROM book_issues bi JOIN books b ON b.id=bi.book_id
+            WHERE bi.student_id=? ORDER BY bi.id DESC
+        """, (student_auth["id"],)).fetchall()
+    return jsonify({"success": True, "books": [{
+        "title": r["title"], "author": r["author"], "issue_date": r["issue_date"],
+        "return_date": r["return_date"], "status": r["status"]} for r in rows]})
+
+
 @app.route("/pending_students")
 @login_required
 def pending_students():
@@ -1181,85 +1255,6 @@ def approve_student(student_id):
 
     flash("Student approved successfully.")
     return redirect("/pending_students")
-
-
-@app.route("/reject_student/<int:student_id>", methods=["POST"])
-@login_required
-def reject_student(student_id):
-    with connect() as con:
-        con.execute(
-            "UPDATE students SET status='Rejected' WHERE id=? AND status='Pending'",
-            (student_id,)
-        )
-
-    flash("Student registration rejected.")
-    return redirect("/pending_students")
-
-@app.route("/admin/import_students", methods=["POST"])
-@login_required
-def import_students():
-    data = request.get_json(silent=True) or {}
-    students = data.get("students", [])
-
-    if not isinstance(students, list) or len(students) > 100:
-        return {"ok": False, "message": "Invalid student data."}, 400
-
-    inserted = 0
-    skipped = 0
-
-    with connect() as con:
-        for s in students:
-            if not isinstance(s, dict):
-                skipped += 1
-                continue
-
-            name = str(s.get("name", "")).strip()
-            guardian = str(s.get("guardian", "")).strip()
-            mobile = str(s.get("mobile", "")).strip()
-            seat = str(s.get("seat", "")).strip()
-            shift = str(s.get("shift", "")).strip()
-            admission = str(s.get("admission_date", "")).strip() or date.today().isoformat()
-
-            if (
-                not all([name, guardian, mobile, seat])
-                or not mobile.isdigit()
-                or len(mobile) != 10
-                or shift not in ("Morning", "Evening")
-            ):
-                skipped += 1
-                continue
-
-            duplicate = con.execute(
-                "SELECT id FROM students WHERE mobile=?",
-                (mobile,)
-            ).fetchone()
-
-            if duplicate:
-                skipped += 1
-                continue
-
-            occupied = con.execute(
-                "SELECT id FROM students WHERE seat=? AND shift=?",
-                (seat, shift)
-            ).fetchone()
-
-            if occupied:
-                skipped += 1
-                continue
-
-            con.execute(
-                """INSERT INTO students
-                   (name, guardian, mobile, seat, shift, admission_date, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (name, guardian, mobile, seat, shift, admission, "Approved")
-            )
-            inserted += 1
-
-    return {
-        "ok": True,
-        "inserted": inserted,
-        "skipped": skipped
-    }
 
 
 # Initialize PostgreSQL database
