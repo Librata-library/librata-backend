@@ -2,14 +2,16 @@ import json
 from flask import Flask, request, redirect, session, render_template_string, url_for, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
+from datetime import date
 import os
 import hashlib
 import secrets
+import urllib.request
+import urllib.error
+import urllib.parse
 import psycopg
 import firebase_admin
-from firebase_admin import credentials, messaging
+from firebase_admin import credentials, messaging, auth
 
 firebase_json = os.environ.get("FIREBASE_CREDENTIALS")
 
@@ -205,6 +207,28 @@ def ensure_student_status_column():
         con.execute("""
             ALTER TABLE students
             ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'Pending'
+        """)
+
+
+def ensure_student_firebase_columns():
+    with connect() as con:
+        con.execute("""
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS email TEXT
+        """)
+        con.execute("""
+            ALTER TABLE students
+            ADD COLUMN IF NOT EXISTS firebase_uid TEXT
+        """)
+        con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_students_email_unique
+            ON students (LOWER(email))
+            WHERE email IS NOT NULL AND email <> ''
+        """)
+        con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_students_firebase_uid_unique
+            ON students (firebase_uid)
+            WHERE firebase_uid IS NOT NULL
         """)
 
 # English is the default. Hindi translations are applied to all visible interface text.
@@ -407,7 +431,7 @@ NAV = """<aside class="sidebar"><div class="brand">LIBRA<span>TA</span></div><di
 <a href="/transactions" class="{{ 'active' if active=='transactions' else '' }}"><span class="ico">↗</span> Income & Expenses</a>
 <a href="/notices" class="{{ 'active' if active=='notices' else '' }}"><span class="ico">▤</span> Notices</a>
 <a href="/reports" class="{{ 'active' if active=='reports' else '' }}"><span class="ico">▥</span> Reports</a>
-<div class="navlabel">ADMIN</div><a href="/pending_students" class="{{ 'active' if active=='pending_students' else '' }}"><span class="ico">♙</span> Pending Approvals</a><a href="/settings" class="{{ 'active' if active=='settings' else '' }}"><span class="ico">⚙</span> Settings</a>
+<div class="navlabel">ADMIN</div><a href="/settings" class="{{ 'active' if active=='settings' else '' }}"><span class="ico">⚙</span> Settings</a>
 <a href="/logout"><span class="ico">↪</span> Logout</a></nav></aside>"""
 
 BASE = """<!doctype html><html lang="{{ 'hi' if lang=='hi' else 'en' }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ title }} | Librata</title>""" + STYLE + """</head><body><div class="shell">""" + NAV + """
@@ -817,18 +841,16 @@ def student_register():
     name = str(data.get("name") or "").strip()
     guardian = str(data.get("guardian") or "").strip()
     mobile = str(data.get("mobile") or "").strip()
+    id_token = str(data.get("id_token") or "").strip()
 
-    if not name or not guardian or not mobile:
+    if not name or not guardian or not mobile or not id_token:
         return jsonify({
             "success": False,
-            "message": "Name, guardian name and mobile are required."
+            "message": "Name, guardian, mobile and verified email are required."
         }), 400
 
     if len(name) > 100 or len(guardian) > 100:
-        return jsonify({
-            "success": False,
-            "message": "Name is too long."
-        }), 400
+        return jsonify({"success": False, "message": "Name is too long."}), 400
 
     if not mobile.isdigit() or len(mobile) != 10:
         return jsonify({
@@ -836,29 +858,70 @@ def student_register():
             "message": "Enter a valid 10-digit mobile number."
         }), 400
 
-    with connect() as con:
-        duplicate = con.execute(
-            "SELECT id FROM students WHERE mobile=?",
-            (mobile,)
-        ).fetchone()
+    if not firebase_admin._apps:
+        return jsonify({
+            "success": False,
+            "message": "Email verification service is temporarily unavailable. Please contact Admin."
+        }), 503
 
-        if duplicate:
-            return jsonify({
-                "success": False,
-                "message": "This mobile number is already registered. Contact Admin."
-            }), 409
+    try:
+        claims = auth.verify_id_token(id_token)
+    except Exception:
+        return jsonify({
+            "success": False,
+            "message": "Email verification could not be confirmed. Please verify your email and try again."
+        }), 401
 
-        con.execute(
-            """INSERT INTO students
-               (name, guardian, mobile, seat, shift, admission_date, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (name, guardian, mobile, "Pending", "Pending",
-             date.today().isoformat(), "Pending")
-        )
+    email = str(claims.get("email") or "").strip().lower()
+    firebase_uid = str(claims.get("uid") or "").strip()
+
+    if not email or not firebase_uid or claims.get("email_verified") is not True:
+        return jsonify({
+            "success": False,
+            "message": "Please verify your email address before submitting registration."
+        }), 403
+
+    try:
+        with connect() as con:
+            duplicate_mobile = con.execute(
+                "SELECT id FROM students WHERE mobile=?", (mobile,)
+            ).fetchone()
+            duplicate_email = con.execute(
+                "SELECT id FROM students WHERE LOWER(email)=LOWER(?)", (email,)
+            ).fetchone()
+            duplicate_uid = con.execute(
+                "SELECT id FROM students WHERE firebase_uid=?", (firebase_uid,)
+            ).fetchone()
+
+            if duplicate_mobile:
+                return jsonify({
+                    "success": False,
+                    "message": "This mobile number is already registered. Contact Admin."
+                }), 409
+            if duplicate_email or duplicate_uid:
+                return jsonify({
+                    "success": False,
+                    "message": "This email is already registered. Contact Admin."
+                }), 409
+
+            con.execute("""
+                INSERT INTO students
+                    (name, guardian, mobile, seat, shift, admission_date,
+                     status, email, firebase_uid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                name, guardian, mobile, "Pending", "Pending",
+                date.today().isoformat(), "Pending", email, firebase_uid
+            ))
+    except psycopg.errors.UniqueViolation:
+        return jsonify({
+            "success": False,
+            "message": "This mobile number or email is already registered. Contact Admin."
+        }), 409
 
     return jsonify({
         "success": True,
-        "message": "Registration submitted. Please wait for Admin approval."
+        "message": "Email verified. Registration submitted. Please wait for Admin approval."
     }), 201
 
 
@@ -987,59 +1050,98 @@ def register_fcm_token():
 @app.route("/api/student/login", methods=["POST"])
 def student_login():
     data = request.get_json(silent=True) or {}
+    mobile = str(data.get("mobile") or "").strip()
+    password = str(data.get("password") or "")
 
-    name = data.get("name", "").strip()
-    mobile = data.get("mobile", "").strip()
-
-    if not name or not mobile:
+    if not mobile or not password:
         return jsonify({
             "success": False,
-            "message": "Name and mobile are required"
+            "message": "Mobile number and password are required."
         }), 400
 
     if not mobile.isdigit() or len(mobile) != 10:
-        return jsonify({
-            "success": False,
-            "message": "Invalid mobile number"
-        }), 400
+        return jsonify({"success": False, "message": "Invalid mobile number."}), 400
 
     with connect() as con:
-        student = con.execute(
-            """SELECT id, name, mobile, seat, shift, status
-               FROM students
-               WHERE LOWER(TRIM(name)) = LOWER(?)
-               AND mobile = ?""",
-            (name, mobile)
-        ).fetchone()
+        student = con.execute("""
+            SELECT id, name, mobile, seat, shift, status, email, firebase_uid
+            FROM students
+            WHERE mobile=?
+        """, (mobile,)).fetchone()
 
-    if not student:
+    if not student or not student["email"] or not student["firebase_uid"]:
         return jsonify({
             "success": False,
-            "message": "Student not found. Contact Admin."
+            "message": "Invalid mobile number or password."
         }), 401
 
     status = student["status"]
-
     if status == "Pending":
         return jsonify({
             "success": False,
             "message": "Your registration is waiting for Admin approval."
         }), 403
-
     if status == "Rejected":
         return jsonify({
             "success": False,
             "message": "Your registration was rejected. Contact Admin."
         }), 403
-
     if status != "Approved":
         return jsonify({
             "success": False,
             "message": "Account status is invalid. Contact Admin."
         }), 403
 
-    auth_token = create_student_token(student["id"])
+    api_key = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({
+            "success": False,
+            "message": "Login service is not configured yet. Please contact Admin."
+        }), 503
 
+    if not firebase_admin._apps:
+        return jsonify({
+            "success": False,
+            "message": "Login service is temporarily unavailable. Please contact Admin."
+        }), 503
+
+    endpoint = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?" + urllib.parse.urlencode({"key": api_key})
+    payload = json.dumps({
+        "email": student["email"],
+        "password": password,
+        "returnSecureToken": True
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            firebase_result = json.loads(response.read().decode("utf-8"))
+        firebase_claims = auth.verify_id_token(firebase_result.get("idToken", ""))
+    except urllib.error.HTTPError:
+        return jsonify({
+            "success": False,
+            "message": "Invalid mobile number or password."
+        }), 401
+    except Exception:
+        return jsonify({
+            "success": False,
+            "message": "Could not sign in right now. Please try again."
+        }), 503
+
+    if (firebase_claims.get("uid") != student["firebase_uid"]
+            or str(firebase_claims.get("email") or "").lower() != str(student["email"]).lower()
+            or firebase_claims.get("email_verified") is not True):
+        return jsonify({
+            "success": False,
+            "message": "Account verification failed. Please contact Admin."
+        }), 401
+
+    auth_token = create_student_token(student["id"])
     return jsonify({
         "success": True,
         "message": "Login successful",
@@ -1051,6 +1153,7 @@ def student_login():
             "shift": student["shift"]
         }
     })
+
 
 @app.route("/api/student/attendance", methods=["GET"])
 def student_attendance():
@@ -1089,78 +1192,100 @@ def student_attendance():
         ]
     })
 
-@app.route("/api/student/attendance/check-in", methods=["POST"])
-def student_attendance_check_in():
-    student_auth = get_authenticated_student()
-    if not student_auth:
-        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
-
-    student_id = student_auth["id"]
-    today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-
-    with connect() as con:
-        existing = con.execute(
-            "SELECT status FROM attendance WHERE student_id=? AND attend_date=?",
-            (student_id, today)
-        ).fetchone()
-        if existing:
-            if existing["status"] == "Absent":
-                return jsonify({"success": False, "message": "Your attendance is marked Absent by Admin. Please contact the Library Admin.", "status": "Absent"}), 409
-            return jsonify({"success": True, "already_marked": True, "message": "Your attendance is already marked Present today.", "status": "Present", "date": today})
-
-        inserted = con.execute("""
-            INSERT INTO attendance (student_id, attend_date, status)
-            VALUES (?, ?, 'Present')
-            ON CONFLICT(student_id, attend_date) DO NOTHING
-            RETURNING id
-        """, (student_id, today)).fetchone()
-        if not inserted:
-            current = con.execute(
-                "SELECT status FROM attendance WHERE student_id=? AND attend_date=?",
-                (student_id, today)
-            ).fetchone()
-            if current and current["status"] == "Absent":
-                return jsonify({"success": False, "message": "Your attendance is marked Absent by Admin. Please contact the Library Admin.", "status": "Absent"}), 409
-            return jsonify({"success": True, "already_marked": True, "message": "Your attendance is already marked Present today.", "status": "Present", "date": today})
-    return jsonify({"success": True, "already_marked": False, "message": "Attendance marked Present successfully.", "status": "Present", "date": today})
-
-
 @app.route("/api/student/fees", methods=["GET"])
 def student_fees():
     student_auth = get_authenticated_student()
+
     if not student_auth:
-        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
+        return jsonify({
+            "success": False,
+            "message": "Unauthorized. Please login again."
+        }), 401
+
+    student_id = student_auth["id"]
+
     with connect() as con:
-        rows = con.execute("""
+        records = con.execute("""
             SELECT fee_month, amount, paid, status, paid_date
-            FROM fees WHERE student_id=? ORDER BY fee_month DESC, id DESC
-        """, (student_auth["id"],)).fetchall()
-    total_amount = sum(float(r["amount"] or 0) for r in rows)
-    total_paid = sum(float(r["paid"] or 0) for r in rows)
+            FROM fees
+            WHERE student_id = ?
+            ORDER BY fee_month DESC
+        """, (student_id,)).fetchall()
+
     return jsonify({
-        "success": True, "total_amount": total_amount, "total_paid": total_paid,
-        "balance": max(0.0, total_amount-total_paid),
-        "fees": [{"fee_month": r["fee_month"], "amount": float(r["amount"] or 0),
-                  "paid": float(r["paid"] or 0), "status": r["status"], "paid_date": r["paid_date"]}
-                 for r in rows]
+        "success": True,
+        "fees": [
+            {
+                "fee_month": r["fee_month"],
+                "amount": r["amount"],
+                "paid": r["paid"],
+                "status": r["status"],
+                "paid_date": r["paid_date"]
+            }
+            for r in records
+        ]
     })
 
 
 @app.route("/api/student/books", methods=["GET"])
 def student_books():
     student_auth = get_authenticated_student()
-    if not student_auth:
-        return jsonify({"success": False, "message": "Unauthorized. Please login again."}), 401
-    with connect() as con:
-        rows = con.execute("""
-            SELECT b.title, b.author, bi.issue_date, bi.return_date, bi.status
-            FROM book_issues bi JOIN books b ON b.id=bi.book_id
-            WHERE bi.student_id=? ORDER BY bi.id DESC
-        """, (student_auth["id"],)).fetchall()
-    return jsonify({"success": True, "books": [{
-        "title": r["title"], "author": r["author"], "issue_date": r["issue_date"],
-        "return_date": r["return_date"], "status": r["status"]} for r in rows]})
 
+    if not student_auth:
+        return jsonify({
+            "success": False,
+            "message": "Unauthorized. Please login again."
+        }), 401
+
+    student_id = student_auth["id"]
+
+    with connect() as con:
+        books = con.execute("""
+            SELECT id, title, author, quantity, available
+            FROM books
+            ORDER BY title ASC
+        """).fetchall()
+
+        issued = con.execute("""
+            SELECT
+                bi.id,
+                bi.book_id,
+                b.title,
+                b.author,
+                bi.issue_date,
+                bi.return_date,
+                bi.status
+            FROM book_issues bi
+            JOIN books b ON b.id = bi.book_id
+            WHERE bi.student_id = ?
+            ORDER BY bi.id DESC
+        """, (student_id,)).fetchall()
+
+    return jsonify({
+        "success": True,
+        "books": [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "author": r["author"],
+                "quantity": r["quantity"],
+                "available": r["available"]
+            }
+            for r in books
+        ],
+        "issued_books": [
+            {
+                "id": r["id"],
+                "book_id": r["book_id"],
+                "title": r["title"],
+                "author": r["author"],
+                "issue_date": r["issue_date"],
+                "return_date": r["return_date"],
+                "status": r["status"]
+            }
+            for r in issued
+        ]
+    })
 
 @app.route("/pending_students")
 @login_required
@@ -1257,10 +1382,90 @@ def approve_student(student_id):
     return redirect("/pending_students")
 
 
+@app.route("/reject_student/<int:student_id>", methods=["POST"])
+@login_required
+def reject_student(student_id):
+    with connect() as con:
+        con.execute(
+            "UPDATE students SET status='Rejected' WHERE id=? AND status='Pending'",
+            (student_id,)
+        )
+
+    flash("Student registration rejected.")
+    return redirect("/pending_students")
+
+@app.route("/admin/import_students", methods=["POST"])
+@login_required
+def import_students():
+    data = request.get_json(silent=True) or {}
+    students = data.get("students", [])
+
+    if not isinstance(students, list) or len(students) > 100:
+        return {"ok": False, "message": "Invalid student data."}, 400
+
+    inserted = 0
+    skipped = 0
+
+    with connect() as con:
+        for s in students:
+            if not isinstance(s, dict):
+                skipped += 1
+                continue
+
+            name = str(s.get("name", "")).strip()
+            guardian = str(s.get("guardian", "")).strip()
+            mobile = str(s.get("mobile", "")).strip()
+            seat = str(s.get("seat", "")).strip()
+            shift = str(s.get("shift", "")).strip()
+            admission = str(s.get("admission_date", "")).strip() or date.today().isoformat()
+
+            if (
+                not all([name, guardian, mobile, seat])
+                or not mobile.isdigit()
+                or len(mobile) != 10
+                or shift not in ("Morning", "Evening")
+            ):
+                skipped += 1
+                continue
+
+            duplicate = con.execute(
+                "SELECT id FROM students WHERE mobile=?",
+                (mobile,)
+            ).fetchone()
+
+            if duplicate:
+                skipped += 1
+                continue
+
+            occupied = con.execute(
+                "SELECT id FROM students WHERE seat=? AND shift=?",
+                (seat, shift)
+            ).fetchone()
+
+            if occupied:
+                skipped += 1
+                continue
+
+            con.execute(
+                """INSERT INTO students
+                   (name, guardian, mobile, seat, shift, admission_date, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, guardian, mobile, seat, shift, admission, "Approved")
+            )
+            inserted += 1
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "skipped": skipped
+    }
+
+
 # Initialize PostgreSQL database
 setup_database()
 ensure_admission_column()
 ensure_student_status_column()
+ensure_student_firebase_columns()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
