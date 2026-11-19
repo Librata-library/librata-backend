@@ -1154,7 +1154,83 @@ def student_login():
             "shift": student["shift"]
         }
     })
+    
+@app.route("/api/student/forgot-password", methods=["POST"])
+def student_forgot_password():
+    data = request.get_json(silent=True) or {}
+    mobile = str(data.get("mobile") or "").strip()
 
+    if not mobile.isdigit() or len(mobile) != 10:
+        return jsonify({
+            "success": False,
+            "message": "Enter a valid 10 digit mobile number."
+        }), 400
+
+    with connect() as con:
+        student = con.execute("""
+            SELECT email, status
+            FROM students
+            WHERE mobile=?
+        """, (mobile,)).fetchone()
+
+    message = (
+        "If your approved account has a registered email, "
+        "a password reset link has been sent."
+    )
+
+    if (not student
+            or student["status"] != "Approved"
+            or not student["email"]):
+        return jsonify({
+            "success": True,
+            "message": message
+        })
+
+    api_key = os.environ.get("FIREBASE_WEB_API_KEY", "").strip()
+
+    if not api_key:
+        return jsonify({
+            "success": False,
+            "message": "Password reset service is not configured."
+        }), 503
+
+    endpoint = (
+        "https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?"
+        + urllib.parse.urlencode({"key": api_key})
+    )
+
+    payload = json.dumps({
+        "requestType": "PASSWORD_RESET",
+        "email": student["email"]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            json.loads(response.read().decode("utf-8"))
+
+    except urllib.error.HTTPError:
+        return jsonify({
+            "success": True,
+            "message": message
+        })
+
+    except Exception:
+        return jsonify({
+            "success": False,
+            "message": "Could not send reset email. Please try again."
+        }), 503
+
+    return jsonify({
+        "success": True,
+        "message": message
+    })
 
 @app.route("/api/student/attendance", methods=["GET"])
 def student_attendance():
