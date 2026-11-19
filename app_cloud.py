@@ -424,6 +424,7 @@ NAV = """<aside class="sidebar"><div class="brand">LIBRA<span>TA</span></div><di
 <div class="navlabel">WORKSPACE</div>
 <a href="/dashboard" class="{{ 'active' if active=='dashboard' else '' }}"><span class="ico">▦</span> Dashboard</a>
 <a href="/students" class="{{ 'active' if active=='students' else '' }}"><span class="ico">♙</span> Students</a>
+<a href="/pending_students" class="{{ 'active' if active=='pending_students' else '' }}"><span class="ico">●</span> Pending Approvals</a>
 <a href="/attendance" class="{{ 'active' if active=='attendance' else '' }}"><span class="ico">✓</span> Attendance</a>
 <a href="/seats" class="{{ 'active' if active=='seats' else '' }}"><span class="ico">▤</span> Seat Management</a>
 <a href="/fees" class="{{ 'active' if active=='fees' else '' }}"><span class="ico">₹</span> Fees</a>
